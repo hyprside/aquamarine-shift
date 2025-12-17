@@ -33,8 +33,6 @@ namespace Aquamarine {
 
         Hyprutils::Memory::CWeakPointer<CTabBackend> backend;
 
-        Hyprutils::Memory::CSharedPointer<std::function<void()>> framecb;
-        bool                                                     frameScheduled = false;
         std::string monitor_id;
 
         friend class CTabBackend;
@@ -60,11 +58,12 @@ namespace Aquamarine {
 
         Hyprutils::Memory::CWeakPointer<CTabBackend>                       self;
         virtual int                                                        drmRenderNodeFD();
-
+        
       private:
+        int timerFd;
         CTabBackend(Hyprutils::Memory::CSharedPointer<CBackend> backend_);
 
-        void handleInput(TabInputEvent* event);
+        void handleInput(TabInputEvent* event,bool& pointerDirty,bool& touchDirty);
         Hyprutils::Memory::CWeakPointer<CBackend>                      backend;
         std::vector<Hyprutils::Memory::CSharedPointer<CTabOutput>>     outputs;
         TabClientHandle*                                               m_pClient = nullptr;

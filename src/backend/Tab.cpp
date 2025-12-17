@@ -8,6 +8,8 @@
 #include <aquamarine/input/Input.hpp>
 #include <cstdlib>
 #include <drm_fourcc.h>
+#include <fcntl.h>
+#include <sys/timerfd.h>
 
 extern "C" {
 #include <tab_client.h>
@@ -167,20 +169,16 @@ class CTabSwapchain : public ISwapchain {
             return true;
         };
 
-        virtual Hyprutils::Memory::CSharedPointer<IBuffer> next(int* age) {
+        virtual CSharedPointer<IBuffer> next(int* age) {
             TabFrameTarget target;
-            TabAcquireResult acquire_status = TAB_ACQUIRE_NO_BUFFERS;
-            while (acquire_status == TAB_ACQUIRE_NO_BUFFERS) {
-                acquire_status = tab_client_acquire_frame(tab_client, monitor_id.c_str(), &target);
-                if(acquire_status == TAB_ACQUIRE_NO_BUFFERS) {
-                    tab_client_poll_events(tab_client);
-                }
-            }
-            if(acquire_status != TAB_ACQUIRE_OK) {
+
+            auto res = tab_client_acquire_frame(tab_client, monitor_id.c_str(), &target);
+            if (res != TAB_ACQUIRE_OK)
                 return nullptr;
-            }
-            return Hyprutils::Memory::CSharedPointer<IBuffer>(new CTabBuffer(target));
-        };
+
+            return CSharedPointer<IBuffer>(new CTabBuffer(target));
+        }
+
         virtual const SSwapchainOptions&                             currentOptions() {
             return options;
         };
@@ -216,14 +214,10 @@ Aquamarine::CTabOutput::CTabOutput(const TabMonitorInfo& monitor_info, Hyprutils
     this->swapchain = Hyprutils::Memory::CSharedPointer<ISwapchain>(new CTabSwapchain(monitor_info, backend.lock()->m_pClient));
     this->monitor_id = std::string(monitor_info.id);
     this->modes.emplace_back(Hyprutils::Memory::CSharedPointer<SOutputMode>(new SOutputMode(Vector2D{(double)monitor_info.width, (double)monitor_info.height}, 60, true)));
-    framecb = makeShared<std::function<void()>>([this]() {
-        frameScheduled = false;
-        events.frame.emit();
-    });
+
 }
 
 Aquamarine::CTabOutput::~CTabOutput() {
-    backend.lock()->backend.lock()->removeIdleEvent(framecb);
     events.destroy.emit();
 }
 
@@ -246,12 +240,6 @@ SP<IBackendImplementation> Aquamarine::CTabOutput::getBackend() {
 
 void Aquamarine::CTabOutput::scheduleFrame(const scheduleFrameReason reason) {
     needsFrame = true;
-
-    if (frameScheduled)
-        return;
-
-    frameScheduled = true;
-    backend.lock()->backend.lock()->addIdleEvent(framecb);
 }
 
 bool Aquamarine::CTabOutput::destroy() {
@@ -272,7 +260,15 @@ Aquamarine::CTabBackend::~CTabBackend() {
 }
 
 Aquamarine::CTabBackend::CTabBackend(SP<CBackend> backend_) : backend(backend_) {
-    ;
+
+    timerFd  = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+
+    struct itimerspec its = {
+        .it_interval = {0, 1000000},  // continuous
+        .it_value    = {0, 1000000},
+    };
+
+    timerfd_settime(timerFd, 0, &its, NULL);
 }
 
 eBackendType Aquamarine::CTabBackend::type() {
@@ -306,8 +302,7 @@ std::vector<SP<SPollFD>> Aquamarine::CTabBackend::pollFDs() {
     if (!m_pClient)
         return {};
 
-    return {{SP<SPollFD>(new SPollFD{.fd=tab_client_get_socket_fd(m_pClient), .onSignal=[this]() { dispatchEvents(); }}),
-             SP<SPollFD>(new SPollFD{.fd=tab_client_get_swap_fd(m_pClient), .onSignal=[this]() { dispatchEvents(); }})}};
+    return {SP<SPollFD>(new SPollFD{.fd=timerFd, .onSignal=[this]() { dispatchEvents(); }})};
 }
 
 int Aquamarine::CTabBackend::drmFD() {
@@ -319,19 +314,20 @@ int Aquamarine::CTabBackend::drmRenderNodeFD() {
 }
 
 bool Aquamarine::CTabBackend::dispatchEvents() {
+    uint64_t expirations;
+    read(timerFd, &expirations, sizeof(expirations));
     if (!m_pClient)
         return true;
-
     tab_client_poll_events(m_pClient);
-
+    bool pointerDirty = false, touchDirty = false;
     TabEvent event;
     while (tab_client_next_event(m_pClient, &event)) {
         switch (event.event_type) {
             case TAB_EVENT_FRAME_DONE: {
-                std::cout << "[tab backend] Frame done for monitor " << event.data.frame_done << "\n";
                 auto mon_id = event.data.frame_done;
                 for (auto& output : outputs) {
                     if (output->monitor_id == mon_id) {
+                        output->needsFrame = false;
                         output->events.present.emit(IOutput::SPresentEvent{.presented = true});
                         break;
                     }
@@ -361,7 +357,7 @@ bool Aquamarine::CTabBackend::dispatchEvents() {
                 break;
             }
             case TabEventType::TAB_EVENT_INPUT: {
-                handleInput(&event.data.input);
+                handleInput(&event.data.input, pointerDirty, touchDirty);
                 break;
             }
             default:
@@ -369,6 +365,19 @@ bool Aquamarine::CTabBackend::dispatchEvents() {
                 break;
         }
     }
+
+    if (pointerDirty && m_pPointer){
+        m_pPointer->events.frame.emit();
+    }
+    if (touchDirty && m_pTouch)
+        m_pTouch->events.frame.emit();
+    TabFrameTarget target;
+    for(auto& output : outputs)
+        if (tab_client_acquire_frame(m_pClient, output->monitor_id.c_str(), &target) == TAB_ACQUIRE_OK)
+            {
+                output->needsFrame = true;
+                output->events.frame.emit();
+            }
     return true;
 }
 
@@ -387,7 +396,11 @@ void Aquamarine::CTabBackend::onReady() {
 
 
 
-void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
+void Aquamarine::CTabBackend::handleInput(TabInputEvent* event,
+    bool& pointerDirty,
+    bool& touchDirty
+) {
+
     switch (event->kind) {
         case TAB_INPUT_KIND_KEY: {
             if (!m_pKeyboard) {
@@ -413,6 +426,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .button  = button.button,
                 .pressed = button.state == TabButtonState::TAB_BUTTON_PRESSED,
             });
+            pointerDirty = true;
             break;
         }
         case TAB_INPUT_KIND_POINTER_MOTION: {
@@ -421,10 +435,17 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 backend.lock()->events.newPointer.emit(m_pPointer);
             }
             auto& motion = event->data.pointer_motion;
-            m_pPointer->events.move.emit(IPointer::SMoveEvent{
+            auto event = IPointer::SMoveEvent{
                 .timeMs = (uint32_t)(motion.time_usec / 1000),
                 .delta  = {motion.dx, motion.dy},
-            });
+                .unaccel  = {motion.unaccel_dx, motion.unaccel_dy},
+                
+
+            };
+            m_pPointer->events.move.emit(event);
+            // debug print
+            
+            pointerDirty = true;
             break;
         }
         case TAB_INPUT_KIND_TOUCH_DOWN: {
@@ -438,6 +459,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .touchID = touch.contact.id,
                 .pos     = {touch.contact.x, touch.contact.y},
             });
+            touchDirty = true;
             break;
         }
         case TAB_INPUT_KIND_TOUCH_UP: {
@@ -450,6 +472,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .timeMs  = (uint32_t)(touch.time_usec / 1000),
                 .touchID = touch.contact_id,
             });
+            touchDirty = true;
             break;
         }
         case TAB_INPUT_KIND_TOUCH_MOTION: {
@@ -463,6 +486,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .touchID = touch.contact.id,
                 .pos     = {touch.contact.x, touch.contact.y},
             });
+            touchDirty = true;
             break;
         }
         case TAB_INPUT_KIND_TABLET_TOOL_AXIS: {
@@ -481,6 +505,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .distance = axis.axes.distance,
                 .rotation = axis.axes.rotation,
             });
+            
             break;
         }
         case TAB_INPUT_KIND_TABLET_TOOL_PROXIMITY: {
@@ -509,6 +534,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .timeMs = (uint32_t)(tip.time_usec / 1000),
                 .down   = tip.state == TAB_TIP_DOWN,
             });
+            
             break;
         }
         case TAB_INPUT_KIND_TABLET_TOOL_BUTTON: {
@@ -524,6 +550,7 @@ void Aquamarine::CTabBackend::handleInput(TabInputEvent* event) {
                 .button = button.button,
                 .down   = button.state == TAB_BUTTON_PRESSED,
             });
+            
             break;
         }
         case TAB_INPUT_KIND_SWITCH_TOGGLE: {
